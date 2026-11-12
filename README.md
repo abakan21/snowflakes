@@ -2,8 +2,6 @@
 
 Snow on top of your macOS desktop. It falls in front of every window, piles up on the top edges of windows and at the bottom of the screen, and the drift travels with its window. Clicks pass straight through the snow.
 
-"Sugrob" (сугроб) is Russian for snowdrift. The idea is inspired by the Flake app; this project is not affiliated with it and shares no code or artwork.
-
 ## Features
 
 - Snowfall over all screens; snow settles on visible window top edges and on the bottom of the screen.
