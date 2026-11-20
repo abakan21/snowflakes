@@ -17,6 +17,10 @@ enum Config {
     static let mittenRadius: CGFloat = 26
     static let keepAbsent: TimeInterval = 600 // how long to keep the drift of a hidden window, s
     static let maxPuffs = 260
+    static let maxChunks = 1500
+    static let collapseDelay: TimeInterval = 0.45  // delay before the snow of a vanished window falls
+    static let tractorSpeed: CGFloat = 90
+    static let tractorTrigger: CGFloat = 0.6       // the tractor comes out when the ground is this full
 }
 
 enum Tool { case watch, mitten }
@@ -24,6 +28,8 @@ enum Tool { case watch, mitten }
 enum Settings {
     static var tool: Tool = .watch
     static var clearRequest = 0
+    static var tractorRequest = 0
+    static var spaceChangedAt: TimeInterval = -100
 }
 
 // MARK: - On-screen windows
@@ -84,6 +90,8 @@ final class Drift {
     var seenFrame = -1
     var lastSeen: TimeInterval = 0
     var dirty = true
+    var missingSince: TimeInterval?
+    var parked = false            // window is on another Space: the drift waits for it
     let node: SKShapeNode
     init(node: SKShapeNode) { self.node = node }
 }
@@ -106,7 +114,14 @@ final class SnowScene: SKScene {
     private var lastCursor: CGPoint?
     private var clearSeen = Settings.clearRequest
     private var clearing: CGFloat = 0
-    private let mitten = SKLabelNode(text: "🧤")
+    private var chunks: [Flake] = []
+    private let mitten = SKSpriteNode(texture: SnowScene.makeMittenTexture())
+    private let tractor = SKSpriteNode(texture: SnowScene.makeTractorTexture())
+    private var tractorActive = false
+    private var tractorX: CGFloat = 0
+    private var tractorDir: CGFloat = 1
+    private var tractorSeen = Settings.tractorRequest
+    private var nextTractorCheck: TimeInterval = 0
 
     init(screen: NSScreen) {
         let f = screen.frame
@@ -115,19 +130,21 @@ final class SnowScene: SKScene {
         screenCG = CGRect(x: f.minX, y: primaryHeight - f.maxY, width: f.width, height: f.height)
         menuBarBottom = max(0, f.maxY - v.maxY)
         let dockAtBottom = v.minY - f.minY > 4
-        groundLimit = dockAtBottom ? 12 : 40   // keep a thin layer over the Dock so icons stay visible
+        groundLimit = dockAtBottom ? 28 : 40   // lower layer over the Dock to cover less of the icons
         texture = SnowScene.makeTexture()
         super.init(size: f.size)
         scaleMode = .resizeFill
         backgroundColor = .clear
         anchorPoint = .zero
 
-        mitten.fontSize = 26
-        mitten.verticalAlignmentMode = .center
-        mitten.horizontalAlignmentMode = .center
         mitten.zPosition = 10
+        mitten.zRotation = 0.25
         mitten.isHidden = true
         addChild(mitten)
+
+        tractor.zPosition = 5
+        tractor.isHidden = true
+        addChild(tractor)
 
         let count = Int(f.width * f.height / 1_000_000 * Config.flakesPerMegapoint)
         for _ in 0..<max(40, count) {
@@ -161,6 +178,108 @@ final class SnowScene: SKScene {
         return SKTexture(image: image)
     }
 
+    private static func makeMittenTexture() -> SKTexture {
+        let image = NSImage(size: NSSize(width: 34, height: 42), flipped: false) { _ in
+            let red = NSColor(calibratedRed: 0.84, green: 0.12, blue: 0.16, alpha: 1)
+            let dark = NSColor(calibratedRed: 0.55, green: 0.05, blue: 0.09, alpha: 1)
+            let thumb = NSBezierPath(ovalIn: NSRect(x: 2, y: 15, width: 13, height: 17))
+            let body = NSBezierPath(roundedRect: NSRect(x: 9, y: 9, width: 21, height: 31), xRadius: 10, yRadius: 10)
+            for shape in [thumb, body] {
+                red.setFill()
+                shape.fill()
+                dark.setStroke()
+                shape.lineWidth = 1
+                shape.stroke()
+            }
+            // white snowflake
+            NSColor.white.setStroke()
+            let cx: CGFloat = 19.5
+            let cy: CGFloat = 27
+            for k in 0..<3 {
+                let a = CGFloat(k) * CGFloat.pi / 3
+                let ray = NSBezierPath()
+                ray.move(to: NSPoint(x: cx - cos(a) * 6, y: cy - sin(a) * 6))
+                ray.line(to: NSPoint(x: cx + cos(a) * 6, y: cy + sin(a) * 6))
+                ray.lineWidth = 1.6
+                ray.lineCapStyle = .round
+                ray.stroke()
+            }
+            // row of white dots
+            NSColor.white.setFill()
+            for x in stride(from: CGFloat(13), through: 26, by: 4.3) {
+                NSBezierPath(ovalIn: NSRect(x: x - 1, y: 15, width: 2, height: 2)).fill()
+            }
+            // white cuff
+            let cuff = NSBezierPath(roundedRect: NSRect(x: 7, y: 2, width: 25, height: 10), xRadius: 4, yRadius: 4)
+            NSColor.white.setFill()
+            cuff.fill()
+            let rib = NSColor(calibratedRed: 0.68, green: 0.75, blue: 0.86, alpha: 1)
+            rib.setStroke()
+            cuff.lineWidth = 1
+            cuff.stroke()
+            for x in stride(from: CGFloat(12), through: 27, by: 5) {
+                let line = NSBezierPath()
+                line.move(to: NSPoint(x: x, y: 4.5))
+                line.line(to: NSPoint(x: x, y: 9.5))
+                line.lineWidth = 1
+                line.stroke()
+            }
+            return true
+        }
+        return SKTexture(image: image)
+    }
+
+    /// The tractor faces right; size 72×48, wheels sit on the bottom edge.
+    private static func makeTractorTexture() -> SKTexture {
+        let image = NSImage(size: NSSize(width: 72, height: 48), flipped: false) { _ in
+            let red = NSColor(calibratedRed: 0.82, green: 0.14, blue: 0.14, alpha: 1)
+            let darkRed = NSColor(calibratedRed: 0.55, green: 0.07, blue: 0.08, alpha: 1)
+            let tyre = NSColor(calibratedWhite: 0.16, alpha: 1)
+            let hub = NSColor(calibratedWhite: 0.8, alpha: 1)
+            let steel = NSColor(calibratedRed: 0.95, green: 0.72, blue: 0.1, alpha: 1)
+
+            // exhaust pipe
+            tyre.setFill()
+            NSBezierPath(rect: NSRect(x: 47, y: 27, width: 3, height: 12)).fill()
+            // hood
+            red.setFill()
+            NSBezierPath(roundedRect: NSRect(x: 24, y: 13, width: 35, height: 16), xRadius: 4, yRadius: 4).fill()
+            // cabin
+            NSBezierPath(roundedRect: NSRect(x: 8, y: 20, width: 23, height: 24), xRadius: 3, yRadius: 3).fill()
+            NSColor(calibratedRed: 0.8, green: 0.91, blue: 1, alpha: 1).setFill()
+            NSBezierPath(roundedRect: NSRect(x: 12, y: 28, width: 15, height: 12), xRadius: 2, yRadius: 2).fill()
+            // roof with snow on it
+            darkRed.setFill()
+            NSBezierPath(roundedRect: NSRect(x: 6, y: 42, width: 27, height: 3), xRadius: 1.5, yRadius: 1.5).fill()
+            NSColor.white.setFill()
+            NSBezierPath(roundedRect: NSRect(x: 7, y: 44.5, width: 25, height: 3), xRadius: 1.5, yRadius: 1.5).fill()
+            // headlight
+            NSColor(calibratedRed: 1, green: 0.9, blue: 0.4, alpha: 1).setFill()
+            NSBezierPath(ovalIn: NSRect(x: 56, y: 20, width: 5, height: 5)).fill()
+            // arm and blade
+            tyre.setFill()
+            NSBezierPath(rect: NSRect(x: 54, y: 8, width: 10, height: 3)).fill()
+            steel.setFill()
+            let blade = NSBezierPath()
+            blade.move(to: NSPoint(x: 62, y: 1))
+            blade.line(to: NSPoint(x: 70, y: 1))
+            blade.curve(to: NSPoint(x: 69, y: 24), controlPoint1: NSPoint(x: 64, y: 8), controlPoint2: NSPoint(x: 64, y: 17))
+            blade.line(to: NSPoint(x: 65, y: 24))
+            blade.curve(to: NSPoint(x: 62, y: 1), controlPoint1: NSPoint(x: 60, y: 17), controlPoint2: NSPoint(x: 60, y: 8))
+            blade.close()
+            blade.fill()
+            // wheels
+            for (cx, cy, r) in [(CGFloat(20), CGFloat(14), CGFloat(14)), (CGFloat(49), CGFloat(9), CGFloat(9))] {
+                tyre.setFill()
+                NSBezierPath(ovalIn: NSRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2)).fill()
+                hub.setFill()
+                NSBezierPath(ovalIn: NSRect(x: cx - r * 0.4, y: cy - r * 0.4, width: r * 0.8, height: r * 0.8)).fill()
+            }
+            return true
+        }
+        return SKTexture(image: image)
+    }
+
     // MARK: Frame
 
     override func update(_ currentTime: TimeInterval) {
@@ -168,12 +287,15 @@ final class SnowScene: SKScene {
         lastTime = currentTime
         frameIndex += 1
 
-        WindowTracker.shared.refresh(now: currentTime)
-        rebuildEdges(now: currentTime)
+        let now = ProcessInfo.processInfo.systemUptime
+        WindowTracker.shared.refresh(now: now)
+        rebuildEdges(now: now)
         stepFlakes(dt)
+        stepChunks(dt)
         stepPuffs(dt)
         applyMitten(dt)
         applyShovel(dt)
+        stepTractor(dt, now: now)
 
         for d in active where d.dirty {
             let moving = relax(d)
@@ -206,9 +328,32 @@ final class SnowScene: SKScene {
                   fronts: rects[0..<i], now: now)
         }
 
-        // Hidden windows: hide the drift but keep it for a while
-        for d in drifts.values where d.seenFrame != frameIndex && !d.node.isHidden {
-            d.node.isHidden = true
+        // The window is gone. If the Space changed, hide the drift and keep it.
+        // If the window was closed or minimized, its snow falls down.
+        var collapsed: [Int] = []
+        for (key, d) in drifts where d.seenFrame != frameIndex && !d.parked {
+            if key == -1 {
+                d.node.isHidden = true
+                continue
+            }
+            guard let since = d.missingSince else {
+                d.missingSince = now
+                continue
+            }
+            guard now - since > Config.collapseDelay else { continue }
+            if abs(Settings.spaceChangedAt - since) < 1.2 {
+                d.parked = true
+                d.node.isHidden = true
+            } else {
+                collapsed.append(key)
+            }
+        }
+        for key in collapsed {
+            if let d = drifts[key] {
+                collapse(d)
+                d.node.removeFromParent()
+                drifts[key] = nil
+            }
         }
         if frameIndex % 120 == 0 {
             let stale = drifts.filter { now - $0.value.lastSeen > Config.keepAbsent }
@@ -271,6 +416,8 @@ final class SnowScene: SKScene {
         d.visible = mask
         d.seenFrame = frameIndex
         d.lastSeen = now
+        d.missingSince = nil
+        d.parked = false
         active.append(d)
     }
 
@@ -321,12 +468,75 @@ final class SnowScene: SKScene {
         }
     }
 
-    private func addSnow(_ d: Drift, at c: Int) {
+    private func addSnow(_ d: Drift, at c: Int, amount: CGFloat = Config.gain) {
         let n = d.h.count
-        d.h[c] = min(d.limit, d.h[c] + Config.gain)
-        if c > 0 { d.h[c - 1] = min(d.limit, d.h[c - 1] + Config.gain / 2) }
-        if c < n - 1 { d.h[c + 1] = min(d.limit, d.h[c + 1] + Config.gain / 2) }
+        d.h[c] = min(d.limit, d.h[c] + amount)
+        if c > 0 { d.h[c - 1] = min(d.limit, d.h[c - 1] + amount / 2) }
+        if c < n - 1 { d.h[c + 1] = min(d.limit, d.h[c + 1] + amount / 2) }
         d.dirty = true
+    }
+
+    // MARK: Snow falling off a closed window
+
+    private func collapse(_ d: Drift) {
+        let col = Config.column
+        var c = 0
+        while c < d.h.count {
+            let second = c + 1 < d.h.count ? d.h[c + 1] : 0
+            let amount = min(d.h[c], d.limit) + min(second, d.limit)
+            if amount > 0.6 && d.visible[c] && chunks.count < Config.maxChunks {
+                let node = SKSpriteNode(texture: texture)
+                let diameter = 4 + min(amount, 60) * 0.1
+                node.size = CGSize(width: diameter, height: diameter)
+                node.zPosition = 3
+                addChild(node)
+                let chunk = Flake(node: node)
+                chunk.x = d.x0 + (CGFloat(c) + 1) * col
+                chunk.y = d.y - amount / 4
+                chunk.vx = CGFloat.random(in: -14...14)
+                chunk.vy = CGFloat.random(in: 0...50)
+                chunk.life = amount
+                node.position = CGPoint(x: chunk.x, y: size.height - chunk.y)
+                chunks.append(chunk)
+            }
+            c += 2
+        }
+    }
+
+    private func stepChunks(_ dt: CGFloat) {
+        let col = Config.column
+        var i = chunks.count - 1
+        while i >= 0 {
+            let p = chunks[i]
+            p.vy = min(700, p.vy + 420 * dt)
+            let nx = p.x + p.vx * dt
+            let ny = p.y + p.vy * dt
+            var done = ny > size.height + 10
+            if !done {
+                for d in active {
+                    let rel = nx - d.x0
+                    guard rel >= 0 else { continue }
+                    let c = Int(rel / col)
+                    guard c < d.h.count, d.visible[c] else { continue }
+                    let surface = d.y - min(d.h[c], d.limit)
+                    if p.y <= surface && ny >= surface {
+                        addSnow(d, at: c, amount: p.life / 2)
+                        done = true
+                        break
+                    }
+                }
+            }
+            if done {
+                p.node.removeFromParent()
+                chunks.swapAt(i, chunks.count - 1)
+                chunks.removeLast()
+            } else {
+                p.x = nx
+                p.y = ny
+                p.node.position = CGPoint(x: nx, y: size.height - ny)
+            }
+            i -= 1
+        }
     }
 
     // MARK: Drifts
@@ -444,7 +654,7 @@ final class SnowScene: SKScene {
             return
         }
         mitten.isHidden = false
-        mitten.position = CGPoint(x: p.x + 16, y: size.height - p.y - 18)
+        mitten.position = CGPoint(x: p.x + 14, y: size.height - p.y - 20)
 
         var vx: CGFloat = 0
         var vy: CGFloat = 0
@@ -476,6 +686,39 @@ final class SnowScene: SKScene {
         }
     }
 
+    // MARK: Tractor (state)
+
+    fileprivate func groundDrift() -> Drift? {
+        guard let g = drifts[-1], g.seenFrame == frameIndex else { return nil }
+        return g
+    }
+
+    fileprivate func tractorPosition() -> CGFloat { tractorX }
+    fileprivate func tractorDirection() -> CGFloat { tractorDir }
+
+    fileprivate func startTractor() {
+        tractorActive = true
+        tractorDir = Bool.random() ? 1 : -1
+        tractorX = tractorDir > 0 ? -60 : size.width + 60
+        tractor.xScale = tractorDir
+        tractor.isHidden = false
+    }
+
+    fileprivate func advanceTractor(_ dt: CGFloat, now: TimeInterval) {
+        tractorX += tractorDir * Config.tractorSpeed * dt
+        let bounce = CGFloat(abs(sin(now * 9))) * 1.2
+        tractor.position = CGPoint(x: tractorX, y: 24 + bounce)
+        if tractorX < -70 || tractorX > size.width + 70 {
+            tractorActive = false
+            tractor.isHidden = true
+            nextTractorCheck = now + 60
+        }
+    }
+
+    fileprivate func throwSnow(x: CGFloat, direction: CGFloat) {
+        spawnPuff(x: x, y: size.height - 16, vx: direction * 130, vy: -30)
+    }
+
     // MARK: Shovel
 
     private func applyShovel(_ dt: CGFloat) {
@@ -499,6 +742,67 @@ final class SnowScene: SKScene {
     }
 }
 
+// MARK: - Tractor
+
+extension SnowScene {
+    fileprivate func stepTractor(_ dt: CGFloat, now: TimeInterval) {
+        guard let ground = groundDrift() else { return }
+        let n = ground.h.count
+        let col = Config.column
+
+        if !tractorActive {
+            var start = false
+            if tractorSeen != Settings.tractorRequest {
+                tractorSeen = Settings.tractorRequest
+                start = true
+            } else if now > nextTractorCheck {
+                nextTractorCheck = now + 5
+                var sum: CGFloat = 0
+                var count: CGFloat = 0
+                for c in 0..<n where ground.visible[c] {
+                    sum += ground.h[c]
+                    count += 1
+                }
+                start = count > 0 && sum / count > ground.limit * Config.tractorTrigger
+            }
+            guard start else { return }
+            startTractor()
+        }
+
+        advanceTractor(dt, now: now)
+        let rear = tractorPosition() - tractorDirection() * 36
+        let blade = tractorPosition() + tractorDirection() * 30
+        let c0 = max(0, Int((min(rear, blade) / col).rounded(.down)))
+        let c1 = min(n - 1, Int((max(rear, blade) / col).rounded(.down)))
+        if c0 <= c1 {
+            var carried: CGFloat = 0
+            for c in c0...c1 where ground.h[c] > 0.8 {
+                carried += ground.h[c] - 0.8
+                ground.h[c] = 0.8
+            }
+            if carried > 0 {
+                // snow is pushed into a heap ahead of the blade; the excess is thrown off
+                var k = 1
+                while carried > 0.01 && k <= 30 {
+                    let t = tractorDirection() > 0 ? c1 + k : c0 - k
+                    guard t >= 0 && t < n else { break }
+                    let room = ground.limit - ground.h[t]
+                    if room > 0 {
+                        let m = min(room, carried)
+                        ground.h[t] += m
+                        carried -= m
+                    }
+                    k += 1
+                }
+                if carried > 0.2 {
+                    throwSnow(x: blade, direction: tractorDirection())
+                }
+                ground.dirty = true
+            }
+        }
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -517,6 +821,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
                                                name: NSApplication.didChangeScreenParametersNotification,
                                                object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(spaceChanged),
+                                                          name: NSWorkspace.activeSpaceDidChangeNotification,
+                                                          object: nil)
     }
 
     private func setupMenu() {
@@ -524,8 +831,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.button?.title = "❄️"
         let menu = NSMenu()
         let shovel = NSMenuItem(title: "Shovel: clear everything", action: #selector(shovelAll), keyEquivalent: "")
+        let plow = NSMenuItem(title: "Call the tractor", action: #selector(callTractor), keyEquivalent: "")
         let quit = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
-        for entry in [pauseItem, NSMenuItem.separator(), watchItem, mittenItem, shovel, NSMenuItem.separator(), quit] {
+        for entry in [pauseItem, NSMenuItem.separator(), watchItem, mittenItem, shovel, plow, NSMenuItem.separator(), quit] {
             entry.target = self
             menu.addItem(entry)
         }
@@ -597,6 +905,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func shovelAll() {
         Settings.clearRequest += 1
+    }
+
+    @objc private func callTractor() {
+        Settings.tractorRequest += 1
+    }
+
+    @objc private func spaceChanged() {
+        Settings.spaceChangedAt = ProcessInfo.processInfo.systemUptime
     }
 
     @objc private func quitApp() {

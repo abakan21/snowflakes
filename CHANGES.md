@@ -1,13 +1,9 @@
-# Iteration 1
+# Iteration 2
 
-First working version.
+Changes since iteration 1.
 
-- Menu bar app (❄️ icon) with no Dock icon.
-- Transparent, click-through overlay on every screen, drawn with SpriteKit.
-- Snowflakes fall in front of all windows.
-- Snow piles up on the visible top edges of windows and along the bottom of the screen; a drift moves with its window.
-- Drifts settle into natural slopes instead of forming spikes.
-- Mitten tool: move the cursor over a drift to sweep snow away.
-- Shovel: clear every drift at once.
-- Pause and resume.
-- `build.sh` builds a universal app, ad-hoc signs it and makes a zip for sharing.
+- Mitten: the emoji is replaced with a hand-drawn red mitten with a white cuff, a white snowflake and a row of white dots.
+- Falling snow: when a window is closed or minimized, its drift breaks into clumps that fall and land on windows below or on the ground.
+- Spaces: drifts are kept, not dropped, when you switch to another Space.
+- Ground layer: the snow along the bottom of the screen can now grow to 28 pt with the Dock at the bottom (was 12 pt) and 40 pt without it.
+- Tractor: a red tractor with a yellow blade drives along the bottom and plows the ground snow. It comes out on its own when the ground is about 60% full, or from the new "Call the tractor" menu item.
