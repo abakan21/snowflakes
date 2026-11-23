@@ -4,6 +4,7 @@
 
 import Cocoa
 import SpriteKit
+import ApplicationServices
 
 // MARK: - Settings
 
@@ -15,10 +16,15 @@ enum Config {
     static let landChance: CGFloat = 0.6      // share of snowflakes that settle on windows
     static let gain: CGFloat = 1.6            // snow added by one snowflake
     static let mittenRadius: CGFloat = 26
+    static let cursorRadius: CGFloat = 14     // the plain cursor pushes snow in a narrow strip
+    static let shedSpeed: CGFloat = 700       // window speed (pt/s) at which snow starts to shed
+    static let shedAccel: CGFloat = 9000      // window jerk that knocks snow off
+    static let slideAccel: CGFloat = 2500     // acceleration that makes snow slide along the window
+    static let dockInset: CGFloat = 5         // how far the Dock top sits above the icon row
     static let keepAbsent: TimeInterval = 600 // how long to keep the drift of a hidden window, s
     static let maxPuffs = 260
     static let maxChunks = 1500
-    static let collapseDelay: TimeInterval = 0.45  // delay before the snow of a vanished window falls
+    static let collapseDelay: TimeInterval = 0.3  // delay before the snow of a vanished window falls
     static let tractorSpeed: CGFloat = 90
     static let tractorTrigger: CGFloat = 0.6       // the tractor comes out when the ground is this full
 }
@@ -30,12 +36,21 @@ enum Settings {
     static var clearRequest = 0
     static var tractorRequest = 0
     static var spaceChangedAt: TimeInterval = -100
+    static var minimizeEvents: [MinimizeEvent] = []
+    static var dockRect: CGRect?      // Dock icon row, global CG coordinates
+}
+
+struct MinimizeEvent {
+    let pid: Int
+    let rect: CGRect?
+    let time: TimeInterval
 }
 
 // MARK: - On-screen windows
 
 struct WinInfo {
     let id: Int
+    let pid: Int
     let rect: CGRect   // global CoreGraphics coordinates: origin top-left, y down
 }
 
@@ -46,7 +61,7 @@ final class WindowTracker {
     private let myPID = Int(ProcessInfo.processInfo.processIdentifier)
 
     func refresh(now: TimeInterval) {
-        guard abs(now - last) > 0.03 else { return }
+        guard abs(now - last) > 0.012 else { return }
         last = now
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return }
@@ -60,7 +75,7 @@ final class WindowTracker {
             else { continue }
             let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1
             guard alpha > 0.05, rect.width >= 120, rect.height >= 60 else { continue }
-            result.append(WinInfo(id: id, rect: rect))
+            result.append(WinInfo(id: id, pid: pid, rect: rect))
         }
         windows = result
     }
@@ -77,6 +92,7 @@ final class Flake {
     var sway: CGFloat = 1
     var lands = true
     var life: CGFloat = 0
+    var owner: Drift?             // drift the clump broke off from: it does not land back on it
     let node: SKSpriteNode
     init(node: SKSpriteNode) { self.node = node }
 }
@@ -90,6 +106,15 @@ final class Drift {
     var seenFrame = -1
     var lastSeen: TimeInterval = 0
     var dirty = true
+    var pid = 0
+    var globalRect = CGRect.zero
+    var moveX: CGFloat = 0        // window shift during the last frame
+    var moveY: CGFloat = 0
+    var velX: CGFloat = 0         // smoothed window velocity
+    var velY: CGFloat = 0
+    var agitated = false          // the window is being moved: snow settles flatter
+    var spillLeft: CGFloat = 0    // snow waiting to fall off the left and right edges
+    var spillRight: CGFloat = 0
     var missingSince: TimeInterval?
     var parked = false            // window is on another Space: the drift waits for it
     let node: SKShapeNode
@@ -115,6 +140,7 @@ final class SnowScene: SKScene {
     private var clearSeen = Settings.clearRequest
     private var clearing: CGFloat = 0
     private var chunks: [Flake] = []
+    private var suppressed: [Int: TimeInterval] = [:]   // minimized windows that get no snow for now
     private let mitten = SKSpriteNode(texture: SnowScene.makeMittenTexture())
     private let tractor = SKSpriteNode(texture: SnowScene.makeTractorTexture())
     private var tractorActive = false
@@ -293,7 +319,8 @@ final class SnowScene: SKScene {
         stepFlakes(dt)
         stepChunks(dt)
         stepPuffs(dt)
-        applyMitten(dt)
+        applyShake(dt)
+        applyCursor(dt)
         applyShovel(dt)
         stepTractor(dt, now: now)
 
@@ -315,24 +342,57 @@ final class SnowScene: SKScene {
             rects.append(w.rect.offsetBy(dx: -screenCG.minX, dy: -screenCG.minY))
         }
 
+        // Windows that were just minimized: snow falls right away
+        for e in Settings.minimizeEvents where now - e.time < 1.0 {
+            var target: Int?
+            if let r = e.rect {
+                for (key, d) in drifts where key >= 0 && d.pid == e.pid && SnowScene.near(d.globalRect, r) {
+                    target = key
+                    break
+                }
+            } else if let w = wins.first(where: { $0.pid == e.pid }) {
+                target = w.id
+            }
+            if let key = target, let d = drifts[key] {
+                if d.seenFrame == frameIndex - 1 { collapse(d) }
+                d.node.removeFromParent()
+                drifts[key] = nil
+                suppressed[key] = now + 2.5
+            }
+        }
+        if frameIndex % 120 == 0 {
+            suppressed = suppressed.filter { $0.value > now }
+        }
+
         // Bottom of the screen
         place(id: -1, x0: 0, y: size.height, width: size.width, limit: groundLimit,
               fronts: rects[0..<rects.count], now: now)
+
+        // Dock (when its bounds are known)
+        if let dock = Settings.dockRect, dock.width > dock.height {
+            let r = dock.offsetBy(dx: -screenCG.minX, dy: -screenCG.minY)
+            let top = r.minY - Config.dockInset
+            if r.maxX > 0, r.minX < size.width, top > menuBarBottom + 40, top < size.height - 6 {
+                place(id: -2, x0: r.minX - 8, y: top, width: r.width + 16, limit: Config.maxDrift,
+                      fronts: rects[0..<0], now: now)
+            }
+        }
 
         // Top edges of windows
         for (i, r) in rects.enumerated() {
             guard r.maxX > 0, r.minX < size.width,
                   r.minY > menuBarBottom + 3, r.minY < size.height - 6 else { continue }
+            if let until = suppressed[wins[i].id], now < until { continue }
             let limit = min(Config.maxDrift, r.minY - menuBarBottom)
             place(id: wins[i].id, x0: r.minX, y: r.minY, width: r.width, limit: limit,
-                  fronts: rects[0..<i], now: now)
+                  fronts: rects[0..<i], now: now, pid: wins[i].pid, global: wins[i].rect)
         }
 
         // The window is gone. If the Space changed, hide the drift and keep it.
         // If the window was closed or minimized, its snow falls down.
         var collapsed: [Int] = []
         for (key, d) in drifts where d.seenFrame != frameIndex && !d.parked {
-            if key == -1 {
+            if key < 0 {
                 d.node.isHidden = true
                 continue
             }
@@ -365,7 +425,8 @@ final class SnowScene: SKScene {
     }
 
     private func place(id: Int, x0: CGFloat, y: CGFloat, width: CGFloat, limit: CGFloat,
-                       fronts: ArraySlice<CGRect>, now: TimeInterval) {
+                       fronts: ArraySlice<CGRect>, now: TimeInterval,
+                       pid: Int = 0, global: CGRect = .zero) {
         let d: Drift
         if let existing = drifts[id] {
             d = existing
@@ -407,6 +468,18 @@ final class SnowScene: SKScene {
             }
         }
 
+        if d.seenFrame == frameIndex - 1 {
+            d.moveX = x0 - d.x0
+            d.moveY = y - d.y
+        } else {
+            d.moveX = 0
+            d.moveY = 0
+            d.velX = 0
+            d.velY = 0
+        }
+        d.pid = pid
+        d.globalRect = global
+
         if d.seenFrame != frameIndex - 1 || d.x0 != x0 || d.y != y || d.limit != limit || d.visible != mask {
             d.dirty = true
         }
@@ -419,6 +492,11 @@ final class SnowScene: SKScene {
         d.missingSince = nil
         d.parked = false
         active.append(d)
+    }
+
+    private static func near(_ a: CGRect, _ b: CGRect) -> Bool {
+        return abs(a.minX - b.minX) < 4 && abs(a.minY - b.minY) < 4
+            && abs(a.width - b.width) < 4 && abs(a.height - b.height) < 4
     }
 
     // MARK: Snowflakes
@@ -468,15 +546,45 @@ final class SnowScene: SKScene {
         }
     }
 
-    private func addSnow(_ d: Drift, at c: Int, amount: CGFloat = Config.gain) {
+    /// Puts snow on a column and its two neighbours. Returns how much did not fit.
+    @discardableResult
+    private func addSnow(_ d: Drift, at c: Int, amount: CGFloat = Config.gain) -> CGFloat {
         let n = d.h.count
-        d.h[c] = min(d.limit, d.h[c] + amount)
-        if c > 0 { d.h[c - 1] = min(d.limit, d.h[c - 1] + amount / 2) }
-        if c < n - 1 { d.h[c + 1] = min(d.limit, d.h[c + 1] + amount / 2) }
+        var left: CGFloat = 0
+        let targets: [(Int, CGFloat)] = [(c, amount), (c - 1, amount / 2), (c + 1, amount / 2)]
+        for (i, part) in targets {
+            if i < 0 || i >= n {
+                left += part
+                continue
+            }
+            let room = max(0, d.limit - d.h[i])
+            let placed = min(room, part)
+            d.h[i] += placed
+            left += part - placed
+        }
         d.dirty = true
+        return left
     }
 
     // MARK: Snow falling off a closed window
+
+    private func spawnChunk(x: CGFloat, y: CGFloat, vx: CGFloat, vy: CGFloat, amount: CGFloat, owner: Drift?) {
+        guard chunks.count < Config.maxChunks else { return }
+        let node = SKSpriteNode(texture: texture)
+        let diameter = 4 + min(amount, 60) * 0.1
+        node.size = CGSize(width: diameter, height: diameter)
+        node.zPosition = 3
+        addChild(node)
+        let chunk = Flake(node: node)
+        chunk.x = x
+        chunk.y = y
+        chunk.vx = vx
+        chunk.vy = vy
+        chunk.life = amount
+        chunk.owner = owner
+        node.position = CGPoint(x: x, y: size.height - y)
+        chunks.append(chunk)
+    }
 
     private func collapse(_ d: Drift) {
         let col = Config.column
@@ -484,20 +592,10 @@ final class SnowScene: SKScene {
         while c < d.h.count {
             let second = c + 1 < d.h.count ? d.h[c + 1] : 0
             let amount = min(d.h[c], d.limit) + min(second, d.limit)
-            if amount > 0.6 && d.visible[c] && chunks.count < Config.maxChunks {
-                let node = SKSpriteNode(texture: texture)
-                let diameter = 4 + min(amount, 60) * 0.1
-                node.size = CGSize(width: diameter, height: diameter)
-                node.zPosition = 3
-                addChild(node)
-                let chunk = Flake(node: node)
-                chunk.x = d.x0 + (CGFloat(c) + 1) * col
-                chunk.y = d.y - amount / 4
-                chunk.vx = CGFloat.random(in: -14...14)
-                chunk.vy = CGFloat.random(in: 0...50)
-                chunk.life = amount
-                node.position = CGPoint(x: chunk.x, y: size.height - chunk.y)
-                chunks.append(chunk)
+            if amount > 0.6 && d.visible[c] {
+                spawnChunk(x: d.x0 + (CGFloat(c) + 1) * col, y: d.y - amount / 4,
+                           vx: CGFloat.random(in: -14...14), vy: CGFloat.random(in: 0...50),
+                           amount: amount, owner: nil)
             }
             c += 2
         }
@@ -513,15 +611,21 @@ final class SnowScene: SKScene {
             let ny = p.y + p.vy * dt
             var done = ny > size.height + 10
             if !done {
-                for d in active {
+                for d in active where d !== p.owner {
                     let rel = nx - d.x0
                     guard rel >= 0 else { continue }
                     let c = Int(rel / col)
                     guard c < d.h.count, d.visible[c] else { continue }
                     let surface = d.y - min(d.h[c], d.limit)
                     if p.y <= surface && ny >= surface {
-                        addSnow(d, at: c, amount: p.life / 2)
-                        done = true
+                        let left = addSnow(d, at: c, amount: p.life / 2)
+                        if left > 1 {
+                            // the drift is full: the remainder keeps falling
+                            p.life = left
+                            p.owner = d
+                        } else {
+                            done = true
+                        }
                         break
                     }
                 }
@@ -546,12 +650,13 @@ final class SnowScene: SKScene {
         let n = d.h.count
         guard n > 2 else { return false }
         var moved: CGFloat = 0
+        let slope = d.agitated ? Config.maxSlope * 0.6 : Config.maxSlope
         for _ in 0..<2 {
             for i in 0..<(n - 1) {
                 let diff = d.h[i] - d.h[i + 1]
                 let a = abs(diff)
-                if a > Config.maxSlope {
-                    let m = (a - Config.maxSlope) * 0.5
+                if a > slope {
+                    let m = (a - slope) * 0.5
                     if diff > 0 {
                         d.h[i] -= m
                         d.h[i + 1] += m
@@ -563,8 +668,30 @@ final class SnowScene: SKScene {
                 }
             }
         }
-        d.h[0] = min(d.h[0], 1.5)
-        d.h[n - 1] = min(d.h[n - 1], 1.5)
+        // Snow that reaches the window edge falls off as a clump instead of vanishing
+        if d.h[0] > 1.5 {
+            d.spillLeft += d.h[0] - 1.5
+            d.h[0] = 1.5
+        }
+        if d.h[n - 1] > 1.5 {
+            d.spillRight += d.h[n - 1] - 1.5
+            d.h[n - 1] = 1.5
+        }
+        let width = CGFloat(n) * Config.column
+        if d.spillLeft > 2.5 {
+            if d.visible[0] {
+                spawnChunk(x: d.x0 - 1, y: d.y - 2, vx: -CGFloat.random(in: 8...30), vy: 0,
+                           amount: d.spillLeft, owner: d)
+            }
+            d.spillLeft = 0
+        }
+        if d.spillRight > 2.5 {
+            if d.visible[n - 1] {
+                spawnChunk(x: d.x0 + width + 1, y: d.y - 2, vx: CGFloat.random(in: 8...30), vy: 0,
+                           amount: d.spillRight, owner: d)
+            }
+            d.spillRight = 0
+        }
         return moved > 0.05
     }
 
@@ -642,46 +769,146 @@ final class SnowScene: SKScene {
         }
     }
 
-    // MARK: Mitten
+    // MARK: Window motion: snow slides and sheds
 
-    private func applyMitten(_ dt: CGFloat) {
+    private func applyShake(_ dt: CGFloat) {
+        let col = Config.column
+        for d in active {
+            let oldVX = d.velX
+            let oldVY = d.velY
+            d.velX = oldVX * 0.5 + (d.moveX / dt) * 0.5
+            d.velY = oldVY * 0.5 + (d.moveY / dt) * 0.5
+            let speed = (d.velX * d.velX + d.velY * d.velY).squareRoot()
+            let wasAgitated = d.agitated
+            d.agitated = speed > 40
+            if d.agitated || wasAgitated { d.dirty = true }
+            guard speed > 1 || abs(oldVX) > 1 || abs(oldVY) > 1 else { continue }
+
+            let ax = (d.velX - oldVX) / dt
+            let ay = (d.velY - oldVY) / dt
+            let accel = (ax * ax + ay * ay).squareRoot()
+            let n = d.h.count
+
+            // Snow lags behind the window and slides against the acceleration
+            if abs(ax) > Config.slideAccel && n > 1 {
+                let f = min(0.45, (abs(ax) - Config.slideAccel) / 25000)
+                if ax > 0 {
+                    for c in 0..<(n - 1) {
+                        let m = d.h[c + 1] * f
+                        d.h[c + 1] -= m
+                        d.h[c] += m
+                    }
+                } else {
+                    for c in stride(from: n - 1, to: 0, by: -1) {
+                        let m = d.h[c - 1] * f
+                        d.h[c - 1] -= m
+                        d.h[c] += m
+                    }
+                }
+                d.dirty = true
+            }
+
+            // Fast dragging and jerks knock snow off in clumps
+            let bySpeed = min(4, max(0, (speed - Config.shedSpeed) / 600))
+            let byJerk = min(8, max(0, (accel - Config.shedAccel) / 6000))
+            let rate = bySpeed + byJerk
+            guard rate > 0 else { continue }
+            let chance = min(1, rate * dt * 2)
+            var loose: CGFloat = 0
+            for c in 0..<n where d.visible[c] && d.h[c] > 0.5 {
+                guard CGFloat.random(in: 0...1) < chance else { continue }
+                let amount = d.h[c] * CGFloat.random(in: 0.3...0.8)
+                d.h[c] -= amount
+                loose += amount
+                if loose > 3 {
+                    spawnChunk(x: d.x0 + (CGFloat(c) + 0.5) * col, y: d.y - d.h[c] - 1,
+                               vx: oldVX * 0.5 + CGFloat.random(in: -25...25),
+                               vy: min(oldVY * 0.5, 60) + CGFloat.random(in: -30...10),
+                               amount: loose, owner: d)
+                    loose = 0
+                }
+            }
+            d.dirty = true
+        }
+    }
+
+    // MARK: Cursor and mitten
+
+    /// The cursor always pushes snow into a heap ahead of it; the mitten is wider and sweeps more away.
+    private func applyCursor(_ dt: CGFloat) {
         let m = NSEvent.mouseLocation
         let p = CGPoint(x: m.x - screenCG.minX, y: (primaryHeight - m.y) - screenCG.minY)
         let inside = p.x >= 0 && p.x <= size.width && p.y >= 0 && p.y <= size.height
-        guard Settings.tool == .mitten, inside else {
+        guard inside else {
             mitten.isHidden = true
             lastCursor = nil
             return
         }
-        mitten.isHidden = false
-        mitten.position = CGPoint(x: p.x + 14, y: size.height - p.y - 20)
+        let isMitten = Settings.tool == .mitten
+        mitten.isHidden = !isMitten
+        if isMitten {
+            mitten.position = CGPoint(x: p.x + 14, y: size.height - p.y - 20)
+        }
 
         var vx: CGFloat = 0
         var vy: CGFloat = 0
         if let prev = lastCursor {
-            vx = max(-900, min(900, (p.x - prev.x) / dt))
-            vy = max(-900, min(900, (p.y - prev.y) / dt))
+            vx = max(-1500, min(1500, (p.x - prev.x) / dt))
+            vy = max(-1500, min(1500, (p.y - prev.y) / dt))
         }
         lastCursor = p
+        let speed = (vx * vx + vy * vy).squareRoot()
 
-        let radius = Config.mittenRadius
+        let radius = isMitten ? Config.mittenRadius : Config.cursorRadius
+        // share of touched snow that flies off instead of being pushed into a heap
+        let fling = isMitten ? min(1, 0.55 + speed / 1500) : min(0.5, max(0, (speed - 900) / 2000))
+        let dirX: CGFloat = vx > 20 ? 1 : (vx < -20 ? -1 : 0)
         let col = Config.column
+
         for d in active {
-            guard p.y > d.y - d.limit - radius, p.y < d.y + 10 else { continue }
+            let n = d.h.count
+            guard p.y > d.y - d.limit - radius, p.y < d.y + 6 else { continue }
             let c0 = max(0, Int(((p.x - radius - d.x0) / col).rounded(.down)))
-            let c1 = min(d.h.count - 1, Int(((p.x + radius - d.x0) / col).rounded(.down)))
+            let c1 = min(n - 1, Int(((p.x + radius - d.x0) / col).rounded(.down)))
             guard c0 <= c1 else { continue }
+            var fly: CGFloat = 0
             for c in c0...c1 where d.visible[c] && d.h[c] > 0.2 {
-                let surface = d.y - d.h[c]
-                guard p.y > surface - radius else { continue }
+                let surface = d.y - min(d.h[c], d.limit)
+                guard p.y > surface - radius * 0.6 else { continue }
                 let cx = d.x0 + (CGFloat(c) + 0.5) * col
                 let k = max(0, 1 - abs(cx - p.x) / radius)
-                let remove = min(d.h[c], d.h[c] * min(1, k * 12 * dt) + 20 * dt * k)
-                d.h[c] -= remove
+                let take = min(d.h[c], d.h[c] * min(1, k * 14 * dt) + 25 * dt * k)
+                guard take > 0.001 else { continue }
+                d.h[c] -= take
                 d.dirty = true
-                if remove > 0.12 && Int.random(in: 0..<3) == 0 {
-                    spawnPuff(x: cx, y: surface, vx: vx * 0.3, vy: min(0, vy * 0.2))
+
+                var push = take * (1 - fling)
+                fly += take - push
+                let side: CGFloat = dirX != 0 ? dirX : (cx >= p.x ? 1 : -1)
+                let step = side > 0 ? 1 : -1
+                let first = Int(((p.x + side * (radius + 2) - d.x0) / col).rounded(.down))
+                for j in 0..<5 {
+                    let t = first + step * j
+                    guard push > 0.001, t >= 0, t < n, d.visible[t] else { break }
+                    let room = d.limit - d.h[t]
+                    if room > 0 {
+                        let movedSnow = min(room, push)
+                        d.h[t] += movedSnow
+                        push -= movedSnow
+                    }
                 }
+                fly += push
+                if fly > 2.5 {
+                    spawnChunk(x: cx, y: surface - 2,
+                               vx: vx * 0.35 + CGFloat.random(in: -30...30),
+                               vy: -CGFloat.random(in: 40...140),
+                               amount: fly, owner: nil)
+                    fly = 0
+                }
+            }
+            if fly > 0.4 {
+                spawnChunk(x: p.x, y: min(p.y, d.y - 2), vx: vx * 0.35, vy: -CGFloat.random(in: 30...90),
+                           amount: fly, owner: nil)
             }
         }
     }
@@ -803,6 +1030,70 @@ extension SnowScene {
     }
 }
 
+// MARK: - Accessibility: window minimize events and Dock bounds
+
+func axFrame(_ element: AXUIElement) -> CGRect? {
+    var posRef: CFTypeRef?
+    var sizeRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posRef) == .success,
+          AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+          let pos = posRef, let sz = sizeRef,
+          CFGetTypeID(pos) == AXValueGetTypeID(), CFGetTypeID(sz) == AXValueGetTypeID()
+    else { return nil }
+    var point = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(pos as! AXValue, .cgPoint, &point),
+          AXValueGetValue(sz as! AXValue, .cgSize, &size) else { return nil }
+    return CGRect(origin: point, size: size)
+}
+
+func axMinimizeCallback(_ observer: AXObserver, _ element: AXUIElement,
+                        _ notification: CFString, _ refcon: UnsafeMutableRawPointer?) {
+    var pid: pid_t = 0
+    AXUIElementGetPid(element, &pid)
+    Settings.minimizeEvents.append(MinimizeEvent(pid: Int(pid), rect: axFrame(element),
+                                                 time: ProcessInfo.processInfo.systemUptime))
+}
+
+func dockListFrame() -> CGRect? {
+    guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else { return nil }
+    let appElement = AXUIElementCreateApplication(dock.processIdentifier)
+    var childrenRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(appElement, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+          let children = childrenRef as? [AXUIElement] else { return nil }
+    for child in children {
+        var roleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &roleRef) == .success,
+           let role = roleRef as? String, role == (kAXListRole as String) {
+            return axFrame(child)
+        }
+    }
+    return nil
+}
+
+final class AXWatcher {
+    static let shared = AXWatcher()
+    private var observers: [pid_t: AXObserver] = [:]
+
+    func sync(pids: Set<pid_t>) {
+        for (pid, observer) in observers where !pids.contains(pid) {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+            observers[pid] = nil
+        }
+        for pid in pids where observers[pid] == nil {
+            var created: AXObserver?
+            guard AXObserverCreate(pid, axMinimizeCallback, &created) == .success,
+                  let observer = created else { continue }
+            let appElement = AXUIElementCreateApplication(pid)
+            guard AXObserverAddNotification(observer, appElement,
+                                            kAXWindowMiniaturizedNotification as CFString, nil) == .success
+            else { continue }
+            CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+            observers[pid] = observer
+        }
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -813,11 +1104,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let pauseItem = NSMenuItem(title: "Pause", action: #selector(AppDelegate.togglePause), keyEquivalent: "p")
     private let watchItem = NSMenuItem(title: "Just watch", action: #selector(AppDelegate.chooseWatch), keyEquivalent: "")
+    private let accessItem = NSMenuItem(title: "Accessibility", action: #selector(AppDelegate.openAccessSettings), keyEquivalent: "")
+    private var housekeeping: Timer?
     private let mittenItem = NSMenuItem(title: "Mitten: sweep snow with the cursor", action: #selector(AppDelegate.chooseMitten), keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenu()
         rebuildOverlays()
+        let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(prompt)
+        housekeeping = Timer.scheduledTimer(timeInterval: 1.5, target: self, selector: #selector(housekeep),
+                                            userInfo: nil, repeats: true)
+        housekeep()
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
                                                name: NSApplication.didChangeScreenParametersNotification,
                                                object: nil)
@@ -833,7 +1131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let shovel = NSMenuItem(title: "Shovel: clear everything", action: #selector(shovelAll), keyEquivalent: "")
         let plow = NSMenuItem(title: "Call the tractor", action: #selector(callTractor), keyEquivalent: "")
         let quit = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
-        for entry in [pauseItem, NSMenuItem.separator(), watchItem, mittenItem, shovel, plow, NSMenuItem.separator(), quit] {
+        for entry in [pauseItem, NSMenuItem.separator(), watchItem, mittenItem, shovel, plow, NSMenuItem.separator(), accessItem, NSMenuItem.separator(), quit] {
             entry.target = self
             menu.addItem(entry)
         }
@@ -905,6 +1203,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func shovelAll() {
         Settings.clearRequest += 1
+    }
+
+    @objc private func housekeep() {
+        let trusted = AXIsProcessTrusted()
+        accessItem.title = trusted ? "Accessibility: enabled ✓" : "Grant Accessibility access…"
+        let now = ProcessInfo.processInfo.systemUptime
+        Settings.minimizeEvents.removeAll { now - $0.time > 2 }
+        if trusted {
+            AXWatcher.shared.sync(pids: Set(WindowTracker.shared.windows.map { pid_t($0.pid) }))
+            Settings.dockRect = dockListFrame()
+        } else {
+            Settings.dockRect = nil
+        }
+    }
+
+    @objc private func openAccessSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     @objc private func callTractor() {
